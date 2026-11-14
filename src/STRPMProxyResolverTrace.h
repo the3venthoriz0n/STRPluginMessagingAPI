@@ -5,10 +5,13 @@
 // The lifecycle resolver deliberately uses Trap Flag only inside the small STR
 // OverlayService methods that publish player-3D state. A raw TF trace would
 // enter every CALL target and immediately leave the owning function. This
-// controller is installed ahead of the resolver VEH and implements debugger-
-// style "step over": it places a one-shot INT3 at the instruction following a
-// CALL, clears TF while the callee executes, then resumes TF tracing when the
-// callee returns.
+// controller implements debugger-style "step over": it places a one-shot INT3
+// at the instruction following a CALL, clears TF while the callee executes,
+// then resumes TF tracing when the callee returns.
+//
+// Single steps themselves are owned by the shared STRPMHookGuard dispatcher;
+// this module only supplies the trace step callback and handles its own
+// step-over INT3.
 
 #include <atomic>
 #include <chrono>
@@ -21,16 +24,20 @@ namespace STRPMProxyResolverTrace
 {
     namespace detail
     {
-        constexpr std::uint32_t kTrapFlag = 0x100u;
         constexpr std::size_t kMaxInstructionBytes = 15;
 
         std::jthread g_worker;
         std::atomic_bool g_started{ false };
         PVOID g_handler{ nullptr };
 
-        thread_local bool g_stepOverArmed = false;
-        thread_local std::uintptr_t g_stepOverAddress = 0;
-        thread_local std::uint8_t g_stepOverOriginalByte = 0;
+        // The step-over INT3 lives in shared code, so its ownership is global:
+        // at most one step-over exists process-wide, owned by one thread. A
+        // different thread that reaches it gets the original byte back and runs
+        // on untraced instead of dying on an unowned INT3.
+        std::atomic<std::uintptr_t> g_stepOverAddress{ 0 };
+        std::atomic<std::uint8_t> g_stepOverOriginalByte{ 0 };
+        std::atomic<DWORD> g_stepOverOwner{ 0 };
+        constexpr auto kTraceHook = STRPMHookGuard::HookId::kProxyTrace;
 
         bool IsLegacyPrefix(std::uint8_t value) noexcept
         {
@@ -124,35 +131,46 @@ namespace STRPMProxyResolverTrace
             return length;
         }
 
+        // Called from the single-step dispatcher (inside a VEH): uses only the
+        // self-contained locked helpers. The return address is inside the traced
+        // function's bounds, which were validated when the entry hook armed.
         bool ArmStepOver(std::uintptr_t address) noexcept
         {
-            if (address < 0x10000 || g_stepOverArmed)
+            if (address < 0x10000 || STRPMHookGuard::IsDisarmed(kTraceHook))
+                return false;
+
+            std::uintptr_t expected = 0;
+            if (!g_stepOverAddress.compare_exchange_strong(expected, address))
                 return false;
 
             std::uint8_t original = 0;
             if (!STRPMProxyResolverBridge::detail::ReadProcessValue(address, original) ||
                 original == 0xCC)
             {
+                g_stepOverAddress.store(0);
                 return false;
             }
-            if (!STRPMProxyResolverBridge::detail::PatchByte(address, 0xCC))
-                return false;
 
-            g_stepOverAddress = address;
-            g_stepOverOriginalByte = original;
-            g_stepOverArmed = true;
+            g_stepOverOriginalByte.store(original);
+            g_stepOverOwner.store(GetCurrentThreadId());
+            STRPMHookGuard::detail::RecordArmedAddress(kTraceHook, address);
+            if (!STRPMProxyResolverBridge::detail::PatchByte(address, 0xCC))
+            {
+                g_stepOverOwner.store(0);
+                g_stepOverAddress.store(0);
+                return false;
+            }
             return true;
         }
 
-        void RearmEntryHookIfNeeded() noexcept
+        void DisarmStepOver()
         {
-            auto*& hook = STRPMProxyResolverBridge::detail::g_rearmHook;
-            if (!hook)
+            const auto address = g_stepOverAddress.load();
+            if (address == 0)
                 return;
-
-            if (hook->armed.load())
-                STRPMProxyResolverBridge::detail::PatchByte(hook->bounds.begin, 0xCC);
-            hook = nullptr;
+            STRPMHookGuard::RestoreBreakpointByte(address, g_stepOverOriginalByte.load());
+            g_stepOverOwner.store(0);
+            g_stepOverAddress.store(0);
         }
 
         bool CaptureLifecycleCall(CONTEXT* context) noexcept
@@ -198,88 +216,85 @@ namespace STRPMProxyResolverTrace
             return false;
         }
 
-        LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        // Trace step with call step-over. Runs from the shared single-step
+        // dispatcher; returns true to keep TF set for the next instruction.
+        bool TraceStep(CONTEXT* context, std::uintptr_t, void*)
         {
-            if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord)
-                return EXCEPTION_CONTINUE_SEARCH;
-
-            auto* context = exceptionInfo->ContextRecord;
-            const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
-            const auto address = reinterpret_cast<std::uintptr_t>(
-                exceptionInfo->ExceptionRecord->ExceptionAddress);
-
-            if (code == EXCEPTION_BREAKPOINT &&
-                g_stepOverArmed && address == g_stepOverAddress)
+            namespace bridge = STRPMProxyResolverBridge::detail;
+            if (!bridge::g_traceActive || STRPMHookGuard::IsDisarmed(bridge::kLifecycleHook))
             {
-                if (!STRPMProxyResolverBridge::detail::PatchByte(
-                        g_stepOverAddress,
-                        g_stepOverOriginalByte))
-                {
-                    return EXCEPTION_CONTINUE_SEARCH;
-                }
-
-                g_stepOverArmed = false;
-                g_stepOverAddress = 0;
-                g_stepOverOriginalByte = 0;
-                context->Rip = static_cast<DWORD64>(address);
-                context->EFlags |= kTrapFlag;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-
-            if (code != EXCEPTION_SINGLE_STEP)
-                return EXCEPTION_CONTINUE_SEARCH;
-
-            const bool ownsSingleStep =
-                STRPMProxyResolverBridge::detail::g_rearmHook != nullptr ||
-                STRPMProxyResolverBridge::detail::g_traceActive;
-            if (!ownsSingleStep)
-                return EXCEPTION_CONTINUE_SEARCH;
-
-            RearmEntryHookIfNeeded();
-
-            if (!STRPMProxyResolverBridge::detail::g_traceActive)
-            {
-                context->EFlags &= ~kTrapFlag;
-                return EXCEPTION_CONTINUE_EXECUTION;
+                bridge::StopTrace(nullptr);
+                return false;
             }
 
             const auto rip = static_cast<std::uintptr_t>(context->Rip);
-            const auto bounds = STRPMProxyResolverBridge::detail::g_traceBounds;
+            const auto bounds = bridge::g_traceBounds;
             if (rip < bounds.begin || rip >= bounds.end ||
-                ++STRPMProxyResolverBridge::detail::g_traceSteps >
-                    STRPMProxyResolverBridge::detail::kMaxTraceSteps)
+                ++bridge::g_traceSteps > bridge::kMaxTraceSteps)
             {
-                STRPMProxyResolverBridge::detail::Log(
-                    "ProxyResolver lifecycle trace ended without a complete mapping");
-                STRPMProxyResolverBridge::detail::StopTrace(context);
-                return EXCEPTION_CONTINUE_EXECUTION;
+                bridge::Log("ProxyResolver lifecycle trace ended without a complete mapping");
+                bridge::StopTrace(nullptr);
+                return false;
             }
 
             const auto callLength = DecodeCallLength(rip);
             if (!callLength)
-            {
-                context->EFlags |= kTrapFlag;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+                return !bridge::StopTraceBeforeFlagsInstruction(rip);
 
             if (CaptureLifecycleCall(context))
             {
-                STRPMProxyResolverBridge::detail::StopTrace(context);
-                return EXCEPTION_CONTINUE_EXECUTION;
+                bridge::StopTrace(nullptr);
+                return false;
             }
 
             const auto returnAddress = rip + *callLength;
             if (returnAddress < bounds.end && ArmStepOver(returnAddress))
             {
-                context->EFlags &= ~kTrapFlag;
-                return EXCEPTION_CONTINUE_EXECUTION;
+                // TF off while the callee runs; the step-over INT3 resumes it.
+                return false;
             }
 
             // If a one-shot breakpoint cannot be armed, keep TF enabled. The
             // trace will safely abandon if execution leaves the owning method;
             // this degrades to a missed mapping, never modified call semantics.
-            context->EFlags |= kTrapFlag;
+            return true;
+        }
+
+        LONG ExceptionHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            auto* context = exceptionInfo->ContextRecord;
+            const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
+            const auto address = reinterpret_cast<std::uintptr_t>(
+                exceptionInfo->ExceptionRecord->ExceptionAddress);
+
+            if (code != EXCEPTION_BREAKPOINT || address == 0 || address != g_stepOverAddress.load())
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            STRPMHookGuard::CountHit(kTraceHook);
+            if (!STRPMHookGuard::RestoreBreakpointByte(address, g_stepOverOriginalByte.load()))
+            {
+                STRPMHookGuard::ReportFault(kTraceHook, "restore of step-over byte failed");
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            const bool ownedByThisThread = g_stepOverOwner.load() == GetCurrentThreadId();
+            g_stepOverOwner.store(0);
+            g_stepOverAddress.store(0);
+            context->Rip = static_cast<DWORD64>(address);
+
+            // Resume tracing only on the thread that armed the step-over.
+            if (ownedByThisThread &&
+                STRPMProxyResolverBridge::detail::g_traceActive &&
+                !STRPMHookGuard::BeginStep(kTraceHook, context, address, &TraceStep))
+            {
+                STRPMProxyResolverBridge::detail::StopTrace(nullptr);
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            return STRPMHookGuard::GuardedHandler(kTraceHook, &ExceptionHandlerInner, exceptionInfo);
         }
 
         bool SleepInterruptible(
@@ -312,9 +327,12 @@ namespace STRPMProxyResolverTrace
             if (token.stop_requested())
                 return;
 
+            STRPMHookGuard::RegisterDisarm(kTraceHook, &DisarmStepOver);
             g_handler = AddVectoredExceptionHandler(1, &ExceptionHandler);
             if (g_handler)
             {
+                // Step-over INT3s can now be handled; route trace steps here.
+                STRPMProxyResolverBridge::detail::g_traceStep.store(&TraceStep);
                 STRPMProxyResolverBridge::detail::Log(
                     "ProxyResolver call step-over controller armed");
             }

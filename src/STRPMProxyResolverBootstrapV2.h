@@ -300,7 +300,8 @@ namespace STRPMProxyResolverBootstrapV2
 
             while (!token.stop_requested())
             {
-                if (!g_observeOnConsume.load() && g_onConsumeAddress != 0)
+                if (!g_observeOnConsume.load() && g_onConsumeAddress != 0 &&
+                    !STRPMHookGuard::IsDisarmed(kIdentityObserverHook))
                 {
                     std::uint8_t currentByte = 0;
                     if (ReadProcessValue(g_onConsumeAddress, currentByte) && currentByte == 0xCC)

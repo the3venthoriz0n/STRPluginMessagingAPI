@@ -47,7 +47,7 @@ namespace STRPMChatUiSuppressV3
 
         inline Base g_executeAsyncBreakpoint{};
         inline PVOID g_vectoredHandler = nullptr;
-        inline thread_local bool g_rearmExecuteAsync = false;
+        inline constexpr auto kChatUiHook = STRPMHookGuard::HookId::kChatUiExecuteAsync;
         inline thread_local std::uint32_t g_pendingEnvelopeCount = 0;
         inline thread_local ULONGLONG g_pendingEnvelopeTick = 0;
         inline std::atomic<std::uint32_t> g_rawEnvelopeLogs{ 0 };
@@ -378,22 +378,32 @@ namespace STRPMChatUiSuppressV3
             std::fclose(file);
         }
 
-        inline LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        // Runs from the shared single-step dispatcher after ExecuteAsync's
+        // original first instruction executed once on this thread.
+        inline bool RearmExecuteAsyncStep(CONTEXT*, std::uintptr_t hookAddress, void*)
         {
-            if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord)
-                return EXCEPTION_CONTINUE_SEARCH;
+            if (g_executeAsyncBreakpoint.armed &&
+                !STRPMHookGuard::RearmBreakpointByte(hookAddress, g_executeAsyncBreakpoint.originalByte))
+            {
+                STRPMHookGuard::ReportFault(kChatUiHook, "re-arm failed (code byte changed or patch failed)");
+            }
+            return false;
+        }
 
+        inline void DisarmExecuteAsync()
+        {
+            if (!g_executeAsyncBreakpoint.armed)
+                return;
+            g_executeAsyncBreakpoint.armed = false;
+            STRPMHookGuard::RestoreBreakpointByte(
+                g_executeAsyncBreakpoint.address,
+                g_executeAsyncBreakpoint.originalByte);
+        }
+
+        inline LONG ExceptionHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
+        {
             const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
             auto* context = exceptionInfo->ContextRecord;
-
-            if (code == EXCEPTION_SINGLE_STEP && g_rearmExecuteAsync)
-            {
-                if (g_executeAsyncBreakpoint.armed)
-                    STRPMChatUiSuppress::detail::PatchByte(g_executeAsyncBreakpoint.address, 0xCC);
-                g_rearmExecuteAsync = false;
-                context->EFlags &= ~0x100u;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
 
             if (code != EXCEPTION_BREAKPOINT)
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -408,6 +418,7 @@ namespace STRPMChatUiSuppressV3
                 return EXCEPTION_CONTINUE_SEARCH;
             }
 
+            STRPMHookGuard::CountHit(kChatUiHook);
             const bool isMessage = IsMessageEvent(static_cast<std::uintptr_t>(context->Rdx));
             if (isMessage)
             {
@@ -444,17 +455,23 @@ namespace STRPMChatUiSuppressV3
                 }
             }
 
-            if (!STRPMChatUiSuppress::detail::PatchByte(
-                    g_executeAsyncBreakpoint.address,
-                    g_executeAsyncBreakpoint.originalByte))
+            const auto hookAddress = g_executeAsyncBreakpoint.address;
+            if (!STRPMHookGuard::RestoreBreakpointByte(hookAddress, g_executeAsyncBreakpoint.originalByte))
             {
+                // The guard re-executes the original code if the INT3 is gone.
+                STRPMHookGuard::ReportFault(kChatUiHook, "restore of original byte failed");
                 return EXCEPTION_CONTINUE_SEARCH;
             }
 
-            g_rearmExecuteAsync = true;
-            context->EFlags |= 0x100u;
-            context->Rip = static_cast<DWORD64>(g_executeAsyncBreakpoint.address);
+            context->Rip = static_cast<DWORD64>(hookAddress);
+            if (!STRPMHookGuard::BeginStep(kChatUiHook, context, hookAddress, &RearmExecuteAsyncStep))
+                STRPMHookGuard::ReportFault(kChatUiHook, "single-step dispatcher unavailable");
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        inline LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            return STRPMHookGuard::GuardedHandler(kChatUiHook, &ExceptionHandlerInner, exceptionInfo);
         }
     }
 
@@ -511,9 +528,12 @@ namespace STRPMChatUiSuppressV3
         return bestTarget;
     }
 
-    inline bool Arm(std::uintptr_t executeAsyncAddress)
+    inline bool Arm(std::uintptr_t executeAsyncAddress, void* allocationBase)
     {
         if (executeAsyncAddress == 0 || !STRPMBridgeReceive::IsResolved())
+            return false;
+
+        if (!STRPMHookGuard::EnsureDispatcher())
             return false;
 
         if (!detail::g_vectoredHandler)
@@ -528,15 +548,36 @@ namespace STRPMChatUiSuppressV3
                 return false;
         }
 
-        std::uint8_t original = 0;
-        if (!detail::ReadProcessValue(executeAsyncAddress, original))
-            return false;
+        STRPMHookGuard::RegisterDisarm(detail::kChatUiHook, &detail::DisarmExecuteAsync);
 
-        detail::g_executeAsyncBreakpoint = detail::Base{ executeAsyncAddress, original, false };
-        if (!STRPMChatUiSuppress::detail::PatchByte(executeAsyncAddress, 0xCC))
-            return false;
+        {
+            // ExecuteAsync is a vote-resolved call target. Require it to be a
+            // function entry in an executable page of the STR allocation whose
+            // first byte is not already INT3 before patching anything.
+            STRPMHookGuard::PatchScope patchScope;
+            if (detail::g_executeAsyncBreakpoint.armed)
+                return false;
 
-        detail::g_executeAsyncBreakpoint.armed = true;
+            std::uint8_t original = 0;
+            if (!STRPMHookGuard::PrepareBreakpoint(
+                    detail::kChatUiHook,
+                    executeAsyncAddress,
+                    allocationBase,
+                    original))
+            {
+                return false;
+            }
+
+            // Mark armed before the INT3 is visible so a thread that hits it
+            // immediately is recognised by the handler.
+            detail::g_executeAsyncBreakpoint = detail::Base{ executeAsyncAddress, original, true };
+            if (!STRPMChatUiSuppress::detail::PatchByte(executeAsyncAddress, 0xCC))
+            {
+                detail::g_executeAsyncBreakpoint.armed = false;
+                return false;
+            }
+        }
+
         STRPMChatUiSuppress::detail::LogAddress(
             "STRPM chat UI OverlayApp::ExecuteAsync breakpoint armed: ",
             executeAsyncAddress);

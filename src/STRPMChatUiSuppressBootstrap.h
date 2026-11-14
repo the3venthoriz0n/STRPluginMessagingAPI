@@ -55,6 +55,7 @@ namespace STRPMChatUiSuppressBootstrap
         inline DWORD WINAPI Worker(void*) noexcept
         {
             std::optional<std::uintptr_t> executeAsyncAddress;
+            void* executeAsyncAllocationBase = nullptr;
 
             for (std::uint32_t attempt = 0;
                  attempt < 120 && !STRPMChatUiSuppress::detail::g_stopRequested.load();
@@ -67,6 +68,7 @@ namespace STRPMChatUiSuppressBootstrap
                     {
                         executeAsyncAddress =
                             STRPMChatUiSuppressV3::ResolveExecuteAsync(allocationBase);
+                        executeAsyncAllocationBase = allocationBase;
                     }
                 }
 
@@ -75,7 +77,7 @@ namespace STRPMChatUiSuppressBootstrap
                 // changing the validated receiver implementation.
                 if (executeAsyncAddress && STRPMBridgeReceive::IsResolved())
                 {
-                    if (STRPMChatUiSuppressV3::Arm(*executeAsyncAddress))
+                    if (STRPMChatUiSuppressV3::Arm(*executeAsyncAddress, executeAsyncAllocationBase))
                     {
                         STRPMChatUiSuppress::detail::Log(
                             "STRPM chat UI suppression armed at OverlayApp::ExecuteAsync");

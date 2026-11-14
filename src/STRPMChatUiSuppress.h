@@ -8,6 +8,8 @@
 #endif
 #include <Windows.h>
 
+#include "STRPMHookGuard.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -69,7 +71,6 @@ namespace STRPMChatUiSuppress
         inline std::atomic<std::uintptr_t> g_filterAddress{ 0 };
         inline std::vector<CandidateBreakpoint> g_candidates;
         inline PVOID g_vectoredHandler = nullptr;
-        inline std::mutex g_patchMutex;
         inline thread_local std::uintptr_t g_rearmAddress = 0;
 
         inline void Log(const char* text) noexcept
@@ -315,15 +316,9 @@ namespace STRPMChatUiSuppress
 
         inline bool PatchByte(std::uintptr_t address, std::uint8_t value) noexcept
         {
-            std::scoped_lock lock(g_patchMutex);
-            DWORD oldProtect = 0;
-            if (!VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-                return false;
-            *reinterpret_cast<volatile std::uint8_t*>(address) = value;
-            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), 1);
-            DWORD ignored = 0;
-            VirtualProtect(reinterpret_cast<void*>(address), 1, oldProtect, &ignored);
-            return true;
+            // Uses the bridge-wide patch lock instead of a module-local mutex so
+            // patches from every hook module are serialised against each other.
+            return STRPMHookGuard::PatchByte(address, value);
         }
 
         inline CandidateBreakpoint* FindCandidate(std::uintptr_t address) noexcept

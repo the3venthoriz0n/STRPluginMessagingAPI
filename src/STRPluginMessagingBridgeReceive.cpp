@@ -1,4 +1,5 @@
 #include "STRPluginMessagingBridgeReceive.h"
+#include "STRPMHookGuard.h"
 #include "STRPMSTRCompatibility.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -122,8 +123,8 @@ namespace STRPMBridgeReceive
         std::uint8_t g_originalByte = 0;
         std::atomic_bool g_breakpointArmed{ false };
         PVOID g_vectoredHandler = nullptr;
-        thread_local bool g_rearmAfterSingleStep = false;
         std::atomic<std::uint32_t> g_suppressedLogCount{ 0 };
+        constexpr auto kReceiveHook = STRPMHookGuard::HookId::kReceiveOnConsume;
 
         void Log(const char* text) noexcept
         {
@@ -497,14 +498,8 @@ namespace STRPMBridgeReceive
 
         bool PatchByte(std::uintptr_t address, std::uint8_t value) noexcept
         {
-            DWORD oldProtect = 0;
-            if (!VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-                return false;
-            *reinterpret_cast<volatile std::uint8_t*>(address) = value;
-            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), 1);
-            DWORD ignored = 0;
-            VirtualProtect(reinterpret_cast<void*>(address), 1, oldProtect, &ignored);
-            return true;
+            // Serialised with every other bridge code patch.
+            return STRPMHookGuard::PatchByte(address, value);
         }
 
         bool ReadBits(LocalReader& reader, std::uint64_t& destination, std::size_t count) noexcept
@@ -1066,22 +1061,28 @@ namespace STRPMBridgeReceive
                 g_captureDispatchThread.join();
         }
 
-        LONG CALLBACK ReceiveExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        // Runs from the shared single-step dispatcher on the thread that hit
+        // OnConsume, after the original first instruction executed once.
+        bool ReceiveRearmStep(CONTEXT*, std::uintptr_t hookAddress, void*)
         {
-            if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord)
-                return EXCEPTION_CONTINUE_SEARCH;
+            if (g_breakpointArmed.load(std::memory_order_relaxed) &&
+                !STRPMHookGuard::RearmBreakpointByte(hookAddress, g_originalByte))
+            {
+                STRPMHookGuard::ReportFault(kReceiveHook, "re-arm failed (code byte changed or patch failed)");
+            }
+            return false;
+        }
 
+        void DisarmReceiveBreakpoint()
+        {
+            if (g_breakpointArmed.exchange(false) && g_onConsumeAddress != 0)
+                STRPMHookGuard::RestoreBreakpointByte(g_onConsumeAddress, g_originalByte);
+        }
+
+        LONG ReceiveExceptionHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
+        {
             const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
             auto* context = exceptionInfo->ContextRecord;
-
-            if (code == EXCEPTION_SINGLE_STEP && g_rearmAfterSingleStep)
-            {
-                if (g_breakpointArmed.load(std::memory_order_relaxed))
-                    PatchByte(g_onConsumeAddress, 0xCC);
-                g_rearmAfterSingleStep = false;
-                context->EFlags &= ~0x100u;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
 
             if (code != EXCEPTION_BREAKPOINT ||
                 reinterpret_cast<std::uintptr_t>(exceptionInfo->ExceptionRecord->ExceptionAddress) != g_onConsumeAddress ||
@@ -1089,6 +1090,7 @@ namespace STRPMBridgeReceive
             {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
+            STRPMHookGuard::CountHit(kReceiveHook);
 
             const auto packetData = reinterpret_cast<const void*>(context->Rdx);
             const auto packetSize = static_cast<std::uint32_t>(context->R8 & 0xFFFFFFFFu);
@@ -1109,18 +1111,34 @@ namespace STRPMBridgeReceive
                 }
             }
 
-            if (!PatchByte(g_onConsumeAddress, g_originalByte))
+            const auto hookAddress = g_onConsumeAddress;
+            if (!STRPMHookGuard::RestoreBreakpointByte(hookAddress, g_originalByte))
+            {
+                // The guard re-executes the original code if the INT3 is gone.
+                STRPMHookGuard::ReportFault(kReceiveHook, "restore of original byte failed");
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
 
-            g_rearmAfterSingleStep = true;
-            context->EFlags |= 0x100u;
-            context->Rip = static_cast<DWORD64>(g_onConsumeAddress);
+            context->Rip = static_cast<DWORD64>(hookAddress);
+            if (!STRPMHookGuard::BeginStep(kReceiveHook, context, hookAddress, &ReceiveRearmStep))
+            {
+                // No dispatcher: leave the original byte in place and run on.
+                STRPMHookGuard::ReportFault(kReceiveHook, "single-step dispatcher unavailable");
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        LONG CALLBACK ReceiveExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            return STRPMHookGuard::GuardedHandler(kReceiveHook, &ReceiveExceptionHandlerInner, exceptionInfo);
         }
 
         bool ArmBreakpoint() noexcept
         {
             if (g_onConsumeAddress == 0 || g_breakpointArmed.load())
+                return false;
+
+            if (!STRPMHookGuard::EnsureDispatcher())
                 return false;
 
             if (!g_vectoredHandler)
@@ -1129,9 +1147,17 @@ namespace STRPMBridgeReceive
                 if (!g_vectoredHandler)
                     return false;
             }
+            STRPMHookGuard::RegisterDisarm(kReceiveHook, &DisarmReceiveBreakpoint);
 
-            if (!ReadProcessValue(g_onConsumeAddress, g_originalByte))
+            STRPMHookGuard::PatchScope patchScope;
+            if (!STRPMHookGuard::PrepareBreakpoint(
+                    kReceiveHook,
+                    g_onConsumeAddress,
+                    GetModuleHandleW(nullptr),
+                    g_originalByte))
+            {
                 return false;
+            }
             g_breakpointArmed.store(true);
             if (!PatchByte(g_onConsumeAddress, 0xCC))
             {
@@ -1183,8 +1209,7 @@ namespace STRPMBridgeReceive
 
     void Stop() noexcept
     {
-        if (g_breakpointArmed.exchange(false) && g_onConsumeAddress != 0)
-            PatchByte(g_onConsumeAddress, g_originalByte);
+        DisarmReceiveBreakpoint();
 
         if (g_vectoredHandler)
         {
@@ -1209,7 +1234,6 @@ namespace STRPMBridgeReceive
         g_callback = nullptr;
         g_userData = nullptr;
         g_onConsumeAddress = 0;
-        g_rearmAfterSingleStep = false;
         g_suppressedLogCount.store(0);
         g_captureDropped.store(0);
     }

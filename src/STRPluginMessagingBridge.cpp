@@ -1,5 +1,6 @@
 #include "STRPluginMessagingAPI/STRPluginMessagingAPI.h"
 #include "STRPluginMessagingBridgeReceive.h"
+#include "STRPMHookGuard.h"
 #include "STRPMSTRCompatibility.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -571,18 +572,12 @@ namespace
         return true;
     }
 
+    constexpr auto kSendCaptureHook = STRPMHookGuard::HookId::kSendCapture;
+
     bool PatchByte(std::uintptr_t address, std::uint8_t value)
     {
-        DWORD oldProtect = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-            return false;
-
-        *reinterpret_cast<volatile std::uint8_t*>(address) = value;
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), 1);
-
-        DWORD ignored = 0;
-        VirtualProtect(reinterpret_cast<void*>(address), 1, oldProtect, &ignored);
-        return true;
+        // Serialised with every other bridge code patch.
+        return STRPMHookGuard::PatchByte(address, value);
     }
 
     void RestoreCaptureBreakpoint()
@@ -592,14 +587,11 @@ namespace
 
         const auto address = g_transportSendAddress.load();
         if (address != 0)
-            PatchByte(address, g_originalTransportByte);
+            STRPMHookGuard::RestoreBreakpointByte(address, g_originalTransportByte);
     }
 
-    LONG CALLBACK CaptureTransportExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+    LONG CaptureTransportExceptionHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
     {
-        if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord)
-            return EXCEPTION_CONTINUE_SEARCH;
-
         const auto address = g_transportSendAddress.load();
         if (exceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT ||
             reinterpret_cast<std::uintptr_t>(exceptionInfo->ExceptionRecord->ExceptionAddress) != address ||
@@ -608,8 +600,15 @@ namespace
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
+        STRPMHookGuard::CountHit(kSendCaptureHook);
         g_transportInstance.store(reinterpret_cast<void*>(exceptionInfo->ContextRecord->Rcx));
-        RestoreCaptureBreakpoint();
+        if (!g_breakpointArmed.exchange(false) ||
+            !STRPMHookGuard::RestoreBreakpointByte(address, g_originalTransportByte))
+        {
+            // Another thread already restored it (the guard then re-executes
+            // the original code) or the restore failed.
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
 
         Log("TransportService instance captured: 0x%llX",
             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(g_transportInstance.load())));
@@ -618,6 +617,22 @@ namespace
         // restart execution at the function entry and let STR continue normally.
         exceptionInfo->ContextRecord->Rip = static_cast<DWORD64>(address);
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    LONG CALLBACK CaptureTransportExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+    {
+        return STRPMHookGuard::GuardedHandler(
+            kSendCaptureHook,
+            &CaptureTransportExceptionHandlerInner,
+            exceptionInfo);
+    }
+
+    const void* AllocationBaseOf(std::uintptr_t address)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (address == 0 || VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi))
+            return nullptr;
+        return mbi.AllocationBase;
     }
 
     bool ArmTransportCaptureBreakpoint()
@@ -632,8 +647,24 @@ namespace
             if (!g_vectoredHandler)
                 return false;
         }
+        STRPMHookGuard::RegisterDisarm(kSendCaptureHook, &RestoreCaptureBreakpoint);
 
-        g_originalTransportByte = *reinterpret_cast<const std::uint8_t*>(address);
+        // TransportService::Send must live either in the module allocation of
+        // the ProcessChatMessage caller it was resolved from or in the STR host
+        // module that owns the TransportService vftable.
+        const void* callerBase = g_processChatBounds
+            ? AllocationBaseOf(g_processChatBounds->begin)
+            : nullptr;
+        const void* hostBase = GetModuleHandleW(nullptr);
+        const void* actualBase = AllocationBaseOf(address);
+        const void* expectedBase =
+            actualBase && (actualBase == callerBase || actualBase == hostBase)
+                ? actualBase
+                : (callerBase ? callerBase : hostBase);
+
+        STRPMHookGuard::PatchScope patchScope;
+        if (!STRPMHookGuard::PrepareBreakpoint(kSendCaptureHook, address, expectedBase, g_originalTransportByte))
+            return false;
         g_breakpointArmed.store(true);
         if (!PatchByte(address, 0xCC))
         {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "STRPluginMessagingAPI/STRPluginMessagingAPI.h"
+#include "STRPMHookGuard.h"
 #include "STRPMSTRCompatibility.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -118,7 +119,15 @@ namespace STRPMProxyResolverBridge
         std::unordered_map<std::uint32_t, STRPM::ProxyFormID> g_playerToForm;
         std::unordered_map<STRPM::ConnectionID, std::uint32_t> g_connectionToPlayer;
 
-        thread_local BreakpointHook* g_rearmHook = nullptr;
+        constexpr auto kLifecycleHook = STRPMHookGuard::HookId::kProxyLifecycle;
+        constexpr auto kTraceHook = STRPMHookGuard::HookId::kProxyTrace;
+        constexpr auto kIdentityObserverHook = STRPMHookGuard::HookId::kProxyIdentityObserver;
+
+        // Single-step callback used while tracing playerLoaded/playerUnloaded.
+        // STRPMProxyResolverTrace replaces it with its step-over controller.
+        bool BridgeTraceStep(CONTEXT* context, std::uintptr_t hookAddress, void* cookie);
+        std::atomic<STRPMHookGuard::StepFn> g_traceStep{ &BridgeTraceStep };
+
         thread_local bool g_traceActive = false;
         thread_local HookKind g_traceKind = HookKind::kPlayerLoaded;
         thread_local FunctionBounds g_traceBounds{};
@@ -532,21 +541,16 @@ namespace STRPMProxyResolverBridge
 
         bool PatchByte(std::uintptr_t address, std::uint8_t value) noexcept
         {
-            DWORD oldProtect = 0;
-            if (!VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-                return false;
-            *reinterpret_cast<volatile std::uint8_t*>(address) = value;
-            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), 1);
-            DWORD ignored = 0;
-            VirtualProtect(reinterpret_cast<void*>(address), 1, oldProtect, &ignored);
-            return true;
+            // Serialised with every other bridge code patch.
+            return STRPMHookGuard::PatchByte(address, value);
         }
 
-        bool ArmHook(BreakpointHook& hook) noexcept
+        // Caller holds STRPMHookGuard::PatchScope.
+        bool ArmHook(BreakpointHook& hook, HMODULE module) noexcept
         {
             if (hook.bounds.begin == 0 || hook.armed.load())
                 return false;
-            if (!ReadProcessValue(hook.bounds.begin, hook.originalByte))
+            if (!STRPMHookGuard::PrepareBreakpoint(kLifecycleHook, hook.bounds.begin, module, hook.originalByte))
                 return false;
             hook.armed.store(true);
             if (!PatchByte(hook.bounds.begin, 0xCC))
@@ -555,6 +559,25 @@ namespace STRPMProxyResolverBridge
                 return false;
             }
             return true;
+        }
+
+        void DisarmHook(BreakpointHook& hook) noexcept
+        {
+            if (hook.armed.exchange(false) && hook.bounds.begin != 0)
+                STRPMHookGuard::RestoreBreakpointByte(hook.bounds.begin, hook.originalByte);
+        }
+
+        void DisarmLifecycleHooks()
+        {
+            DisarmHook(g_connectedHook);
+            DisarmHook(g_disconnectedHook);
+            DisarmHook(g_playerLoadedHook);
+            DisarmHook(g_playerUnloadedHook);
+        }
+
+        void DisarmIdentityObserver()
+        {
+            g_observeOnConsume.store(false);
         }
 
         bool ReadBits(LocalReader& reader, std::uint64_t& destination, std::size_t count) noexcept
@@ -931,80 +954,132 @@ namespace STRPMProxyResolverBridge
                 context->EFlags &= ~0x100u;
         }
 
-        LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        // pushfq/popfq/iretq while TF is set would leak TF into saved flags (or
+        // drop it), producing an orphaned single-step later. Stop tracing before
+        // the CPU executes one of them.
+        bool IsFlagsStackInstruction(std::uintptr_t address) noexcept
         {
-            if (!exceptionInfo || !exceptionInfo->ExceptionRecord || !exceptionInfo->ContextRecord)
-                return EXCEPTION_CONTINUE_SEARCH;
+            std::uint8_t bytes[15]{};
+            if (!ReadProcessBytes(address, bytes, sizeof(bytes)))
+                return true; // unreadable: do not keep tracing blind
+            std::size_t index = 0;
+            while (index < sizeof(bytes))
+            {
+                const auto value = bytes[index];
+                const bool legacyPrefix =
+                    value == 0x26 || value == 0x2E || value == 0x36 || value == 0x3E ||
+                    value == 0x64 || value == 0x65 || value == 0x66 || value == 0x67 ||
+                    value == 0xF0 || value == 0xF2 || value == 0xF3;
+                if (!legacyPrefix && (value < 0x40 || value > 0x4F))
+                    break;
+                ++index;
+            }
+            if (index >= sizeof(bytes))
+                return true;
+            const auto opcode = bytes[index];
+            return opcode == 0x9C || opcode == 0x9D || opcode == 0xCF;
+        }
 
-            const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
-            auto* context = exceptionInfo->ContextRecord;
+        bool StopTraceBeforeFlagsInstruction(std::uintptr_t rip) noexcept
+        {
+            if (!IsFlagsStackInstruction(rip))
+                return false;
+            static std::atomic<std::uint32_t> logged{ 0 };
+            if (logged.fetch_add(1) < 3)
+                Log("ProxyResolver lifecycle trace stopped before a flags push/pop at 0x%llX",
+                    static_cast<unsigned long long>(rip));
+            StopTrace(nullptr);
+            return true;
+        }
+
+        // Runs from the shared single-step dispatcher after a lifecycle hook's
+        // original first instruction executed once on this thread.
+        bool LifecycleRearmStep(CONTEXT*, std::uintptr_t hookAddress, void* cookie)
+        {
+            auto* hook = static_cast<BreakpointHook*>(cookie);
+            if (hook && hook->armed.load() &&
+                !STRPMHookGuard::RearmBreakpointByte(hookAddress, hook->originalByte))
+            {
+                STRPMHookGuard::ReportFault(kLifecycleHook, "re-arm failed (code byte changed or patch failed)");
+            }
+            return false;
+        }
+
+        // Default trace step (used until the step-over controller registers).
+        // Returns true to keep single-stepping. Never touches TF itself; the
+        // dispatcher sets or clears it.
+        bool BridgeTraceStep(CONTEXT* context, std::uintptr_t, void*)
+        {
+            if (!g_traceActive || STRPMHookGuard::IsDisarmed(kLifecycleHook))
+            {
+                StopTrace(nullptr);
+                return false;
+            }
+
+            const auto rip = static_cast<std::uintptr_t>(context->Rip);
+            if (rip < g_traceBounds.begin || rip >= g_traceBounds.end ||
+                ++g_traceSteps > kMaxTraceSteps)
+            {
+                Log("ProxyResolver lifecycle trace ended without a complete mapping");
+                StopTrace(nullptr);
+                return false;
+            }
+
+            if (IsCallInstruction(rip))
+            {
+                if (g_traceKind == HookKind::kPlayerLoaded && IsPlausibleProxyFormID(context->Rcx))
+                    g_traceFormID = static_cast<STRPM::ProxyFormID>(context->Rcx & 0xFFFFFFFFu);
+
+                const auto index = static_cast<std::uint32_t>(context->Rdx & 0xFFFFFFFFu);
+                const auto playerId = static_cast<std::uint32_t>(context->R8 & 0xFFFFFFFFu);
+                const bool plausiblePlayerId = playerId > 0 && playerId <= kMaxPlausiblePlayerId;
+                if (index == 0 && plausiblePlayerId)
+                {
+                    if (g_traceKind == HookKind::kPlayerLoaded &&
+                        g_traceFormID != STRPM::kInvalidProxyFormID)
+                    {
+                        ObservePlayerProxy(playerId, g_traceFormID);
+                        StopTrace(nullptr);
+                        return false;
+                    }
+                    if (g_traceKind == HookKind::kPlayerUnloaded)
+                    {
+                        RemovePlayerProxy(playerId);
+                        StopTrace(nullptr);
+                        return false;
+                    }
+                }
+            }
+
+            if (StopTraceBeforeFlagsInstruction(rip))
+                return false;
+            return true;
+        }
+
+        LONG ObserverHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
+        {
             const auto address = reinterpret_cast<std::uintptr_t>(
                 exceptionInfo->ExceptionRecord->ExceptionAddress);
-
-            if (code == EXCEPTION_BREAKPOINT &&
+            if (exceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
                 g_observeOnConsume.load() &&
                 address == g_onConsumeAddress)
             {
                 // Do not consume or modify this breakpoint. The validated v0.7.0
                 // receive handler owns it; we only observe authenticated relay
                 // metadata before that handler suppresses the reserved packet.
-                ObserveIncomingEnvelope(context);
-                return EXCEPTION_CONTINUE_SEARCH;
+                // Guarded separately: a fault here disarms only the observer.
+                STRPMHookGuard::CountHit(kIdentityObserverHook);
+                ObserveIncomingEnvelope(exceptionInfo->ContextRecord);
             }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
 
-            if (code == EXCEPTION_SINGLE_STEP && (g_rearmHook || g_traceActive))
-            {
-                if (g_rearmHook)
-                {
-                    if (g_rearmHook->armed.load())
-                        PatchByte(g_rearmHook->bounds.begin, 0xCC);
-                    g_rearmHook = nullptr;
-                }
-
-                if (!g_traceActive)
-                {
-                    context->EFlags &= ~0x100u;
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-
-                const auto rip = static_cast<std::uintptr_t>(context->Rip);
-                if (rip < g_traceBounds.begin || rip >= g_traceBounds.end ||
-                    ++g_traceSteps > kMaxTraceSteps)
-                {
-                    Log("ProxyResolver lifecycle trace ended without a complete mapping");
-                    StopTrace(context);
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-
-                if (IsCallInstruction(rip))
-                {
-                    if (g_traceKind == HookKind::kPlayerLoaded && IsPlausibleProxyFormID(context->Rcx))
-                        g_traceFormID = static_cast<STRPM::ProxyFormID>(context->Rcx & 0xFFFFFFFFu);
-
-                    const auto index = static_cast<std::uint32_t>(context->Rdx & 0xFFFFFFFFu);
-                    const auto playerId = static_cast<std::uint32_t>(context->R8 & 0xFFFFFFFFu);
-                    const bool plausiblePlayerId = playerId > 0 && playerId <= kMaxPlausiblePlayerId;
-                    if (index == 0 && plausiblePlayerId)
-                    {
-                        if (g_traceKind == HookKind::kPlayerLoaded &&
-                            g_traceFormID != STRPM::kInvalidProxyFormID)
-                        {
-                            ObservePlayerProxy(playerId, g_traceFormID);
-                            StopTrace(context);
-                            return EXCEPTION_CONTINUE_EXECUTION;
-                        }
-                        if (g_traceKind == HookKind::kPlayerUnloaded)
-                        {
-                            RemovePlayerProxy(playerId);
-                            StopTrace(context);
-                            return EXCEPTION_CONTINUE_EXECUTION;
-                        }
-                    }
-                }
-
-                context->EFlags |= 0x100u;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        LONG ExceptionHandlerInner(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            const auto code = exceptionInfo->ExceptionRecord->ExceptionCode;
+            auto* context = exceptionInfo->ContextRecord;
+            const auto address = reinterpret_cast<std::uintptr_t>(
+                exceptionInfo->ExceptionRecord->ExceptionAddress);
 
             if (code != EXCEPTION_BREAKPOINT)
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -1012,12 +1087,20 @@ namespace STRPMProxyResolverBridge
             auto* hook = FindHook(address);
             if (!hook)
                 return EXCEPTION_CONTINUE_SEARCH;
-            if (!PatchByte(address, hook->originalByte))
+            STRPMHookGuard::CountHit(kLifecycleHook);
+            if (!STRPMHookGuard::RestoreBreakpointByte(address, hook->originalByte))
+            {
+                // The guard re-executes the original code if the INT3 is gone.
+                STRPMHookGuard::ReportFault(kLifecycleHook, "restore of original byte failed");
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
 
-            g_rearmHook = hook;
             context->Rip = static_cast<DWORD64>(address);
-            context->EFlags |= 0x100u;
+            if (!STRPMHookGuard::BeginStep(kLifecycleHook, context, address, &LifecycleRearmStep, hook))
+            {
+                STRPMHookGuard::ReportFault(kLifecycleHook, "single-step dispatcher unavailable");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
 
             switch (hook->kind)
             {
@@ -1037,10 +1120,22 @@ namespace STRPMProxyResolverBridge
                 g_traceBounds = hook->bounds;
                 g_traceFormID = STRPM::kInvalidProxyFormID;
                 g_traceSteps = 0;
+                if (STRPMHookGuard::IsDisarmed(kTraceHook) ||
+                    !STRPMHookGuard::BeginStep(kTraceHook, context, address, g_traceStep.load()))
+                {
+                    StopTrace(nullptr);
+                }
                 break;
             }
 
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        LONG CALLBACK ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+        {
+            // The observer never claims the exception; it always falls through.
+            STRPMHookGuard::GuardedHandler(kIdentityObserverHook, &ObserverHandlerInner, exceptionInfo);
+            return STRPMHookGuard::GuardedHandler(kLifecycleHook, &ExceptionHandlerInner, exceptionInfo);
         }
 
         bool ConfigureHooks(
@@ -1048,6 +1143,16 @@ namespace STRPMProxyResolverBridge
             const FunctionBounds& loaded,
             const FunctionBounds& unloaded) noexcept
         {
+            // Never move a hook's bounds while its INT3 is live.
+            if (g_connectedHook.armed.load() || g_disconnectedHook.armed.load() ||
+                g_playerLoadedHook.armed.load() || g_playerUnloadedHook.armed.load())
+            {
+                return false;
+            }
+
+            if (!STRPMHookGuard::EnsureDispatcher())
+                return false;
+
             g_onConsumeAddress = transport.onConsume;
             g_connectedHook.kind = HookKind::kConnected;
             g_connectedHook.bounds = { transport.onConnected, transport.onConnected + 1 };
@@ -1065,9 +1170,17 @@ namespace STRPMProxyResolverBridge
                     return false;
             }
 
-            if (!ArmHook(g_connectedHook) || !ArmHook(g_disconnectedHook) ||
-                !ArmHook(g_playerLoadedHook) || !ArmHook(g_playerUnloadedHook))
+            STRPMHookGuard::RegisterDisarm(kLifecycleHook, &DisarmLifecycleHooks);
+            STRPMHookGuard::RegisterDisarm(kIdentityObserverHook, &DisarmIdentityObserver);
+
+            // All four or none: a partial arm used to leave live INT3s behind
+            // whose bounds the next retry would overwrite.
+            const auto module = GetModuleHandleW(nullptr);
+            STRPMHookGuard::PatchScope patchScope;
+            if (!ArmHook(g_connectedHook, module) || !ArmHook(g_disconnectedHook, module) ||
+                !ArmHook(g_playerLoadedHook, module) || !ArmHook(g_playerUnloadedHook, module))
             {
+                DisarmLifecycleHooks();
                 return false;
             }
             return true;
@@ -1122,7 +1235,8 @@ namespace STRPMProxyResolverBridge
 
             while (!token.stop_requested())
             {
-                if (!g_observeOnConsume.load() && g_onConsumeAddress != 0)
+                if (!g_observeOnConsume.load() && g_onConsumeAddress != 0 &&
+                    !STRPMHookGuard::IsDisarmed(kIdentityObserverHook))
                 {
                     std::uint8_t currentByte = 0;
                     if (ReadProcessValue(g_onConsumeAddress, currentByte) && currentByte == 0xCC)

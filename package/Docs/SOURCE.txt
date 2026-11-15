@@ -1,0 +1,11 @@
+STR Plugin Messaging API (STRPM) source code and licence information
+
+Source code: https://github.com/the3venthoriz0n/STRPluginMessagingAPI
+(the original project is https://github.com/Caelvanost/STRPluginMessagingAPI by Caelvanost).
+Every GitHub release also has a source archive attached (STRPluginMessagingAPI_<version>_source.zip).
+
+Licence: the relay manifest (strpm-chat-relay.manifest) declares MIT. The repository does not contain a
+separate LICENSE file (flagged to the maintainer), and no licence text is invented here. STRPM links no third-party
+library: it uses only the Windows SDK and the C++ standard library at build time.
+
+Credits: see CREDITS.txt in this folder.

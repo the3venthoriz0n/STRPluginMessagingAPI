@@ -95,6 +95,12 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $Package "fomod") -Destination (Join-Path $Stage "fomod") -Recurse -Force
 
+# Credits and source pointer travel inside the archive (Docs/STRPluginMessagingAPI).
+$DocsDir = Join-Path $Stage "Docs\STRPluginMessagingAPI"
+New-Item -ItemType Directory -Force -Path $DocsDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $Root "CREDITS.md") -Destination (Join-Path $DocsDir "CREDITS.txt") -Force
+Copy-Item -LiteralPath (Join-Path $Package "Docs\SOURCE.txt") -Destination (Join-Path $DocsDir "SOURCE.txt") -Force
+
 $CommonPluginDir = Join-Path $Stage "Common\SKSE\Plugins"
 New-Item -ItemType Directory -Force -Path $CommonPluginDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $Package "Data\SKSE\Plugins\STRPluginMessagingAPI.ini") -Destination $CommonPluginDir -Force
@@ -150,6 +156,8 @@ try {
     $RequiredEntries = @(
         "fomod/info.xml",
         "fomod/ModuleConfig.xml",
+        "Docs/STRPluginMessagingAPI/CREDITS.txt",
+        "Docs/STRPluginMessagingAPI/SOURCE.txt",
         "Common/SKSE/Plugins/STRPluginMessagingAPI.ini",
         "Runtime/Skyrim-1.6.1170/SKSE/Plugins/STRPluginMessagingAPI.dll",
         "Runtime/Skyrim-1.6.1170/SKSE/Plugins/STRPluginMessagingBridge.dll",

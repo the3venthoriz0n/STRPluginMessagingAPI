@@ -128,6 +128,12 @@ jobs:
           }
           Copy-Item "extras/str-server-resources/strpm-chat-relay" $serverResources -Recurse -Force
 
+          # Credits and source pointer travel inside the archive.
+          $docs = "$root/Docs/STRPluginMessagingAPI"
+          New-Item -ItemType Directory -Force -Path $docs | Out-Null
+          Copy-Item "CREDITS.md" "$docs/CREDITS.txt"
+          Copy-Item "package/Docs/SOURCE.txt" "$docs/SOURCE.txt"
+
           $zip = "dist/$zipName"
           Compress-Archive -Path "$root/*" -DestinationPath $zip -Force
 
@@ -138,6 +144,8 @@ jobs:
             $required = @(
               "fomod/info.xml",
               "fomod/ModuleConfig.xml",
+              "Docs/STRPluginMessagingAPI/CREDITS.txt",
+              "Docs/STRPluginMessagingAPI/SOURCE.txt",
               "Common/SKSE/Plugins/STRPluginMessagingAPI.ini",
               "Runtime/Skyrim-1.6.1170/SKSE/Plugins/STRPluginMessagingAPI.dll",
               "Runtime/Skyrim-1.6.1170/SKSE/Plugins/STRPluginMessagingBridge.dll",
@@ -154,10 +162,23 @@ jobs:
             $archive.Dispose()
           }
 
+      # The source archive: the repository at the tagged commit (this repo has no submodules). -OverlayWorkingTree adds the
+      # stamped version numbers, which are not committed at this point. Attached to the GitHub release only.
+      - name: Source archive
+        id: source
+        shell: pwsh
+        run: |
+          git submodule status --recursive
+          powershell -File tools\make_source_archive.ps1 -Version ${{ steps.ver.outputs.full }} -OverlayWorkingTree
+          if ($LASTEXITCODE -ne 0) { throw "make_source_archive.ps1 failed" }
+          if (-not (Test-Path "dist\STRPluginMessagingAPI_${{ steps.ver.outputs.full }}_source.zip")) { throw "Source archive was not written under the expected name" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: STRPluginMessagingAPI_${{ steps.ver.outputs.full }}
-          path: dist/STRPluginMessagingAPI_${{ steps.ver.outputs.full }}.zip
+          path: |
+            dist/STRPluginMessagingAPI_${{ steps.ver.outputs.full }}.zip
+            dist/STRPluginMessagingAPI_${{ steps.ver.outputs.full }}_source.zip
 
       - name: GitHub release
         if: github.ref_type == 'tag'
@@ -167,4 +188,4 @@ jobs:
         run: |
           $extra = @()
           if ('${{ steps.ver.outputs.test }}' -eq 'true') { $extra += '--prerelease' }
-          gh release create "$env:GITHUB_REF_NAME" "dist\STRPluginMessagingAPI_${{ steps.ver.outputs.full }}.zip" --generate-notes --title "STRPluginMessagingAPI_${{ steps.ver.outputs.full }}" @extra
+          gh release create "$env:GITHUB_REF_NAME" "dist\STRPluginMessagingAPI_${{ steps.ver.outputs.full }}_source.zip" "dist\STRPluginMessagingAPI_${{ steps.ver.outputs.full }}.zip" --generate-notes --title "STRPluginMessagingAPI_${{ steps.ver.outputs.full }}" @extra

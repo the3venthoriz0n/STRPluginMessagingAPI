@@ -304,6 +304,17 @@ The selected runtime installs only its matching SKSE DLL variant. The server rel
 Data/SkyrimTogetherReborn/resources/strpm-chat-relay/
 ```
 
+## License, credits and source
+
+- **Licence.** The relay manifest declares MIT (`license = "MIT"`). This repository has no separate LICENSE file, so none is
+  reproduced here. STRPM links no third-party library and no GPL code (it does not use CommonLibSSE-NG).
+- **Credits.** [CREDITS.md](CREDITS.md): Caelvanost (author), the3venthoriz0n (maintainer of this fork), the AI assistants
+  (Codex, Claude), Skyrim Together Reborn / Tilted Phoques, SKSE and Bethesda. It is in the download as
+  `Docs/STRPluginMessagingAPI/CREDITS.txt`.
+- **Source.** https://github.com/the3venthoriz0n/STRPluginMessagingAPI (original: https://github.com/Caelvanost/STRPluginMessagingAPI).
+  Every GitHub release has `STRPluginMessagingAPI_<version>_source.zip` attached next to the mod zip; make one yourself with
+  `powershell -File tools\make_source_archive.ps1`. `Docs/STRPluginMessagingAPI/SOURCE.txt` in the download says the same.
+
 ## Build
 
 ### Normal release package

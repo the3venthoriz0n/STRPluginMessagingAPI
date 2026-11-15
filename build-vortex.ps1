@@ -77,11 +77,18 @@ function Invoke-STRPMBuild {
 Invoke-STRPMBuild -Runtime "1.6.1170" -BuildDir $Build16
 Invoke-STRPMBuild -Runtime "1.7.104" -BuildDir $Build17
 
-foreach ($Path in @($Stage, $Zip)) {
-    if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Recurse -Force
-    }
+# Never replace an earlier build: if the target already exists, add a _yyyyMMdd-HHmmss suffix before the extension.
+function Get-UniquePath([string]$P) {
+    if (-not (Test-Path -LiteralPath $P)) { return $P }
+    $dir  = Split-Path -Parent $P
+    $base = if (Test-Path -LiteralPath $P -PathType Container) { Split-Path -Leaf $P } else { [System.IO.Path]::GetFileNameWithoutExtension($P) }
+    $ext  = if (Test-Path -LiteralPath $P -PathType Container) { "" } else { [System.IO.Path]::GetExtension($P) }
+    return (Join-Path $dir ("{0}_{1}{2}" -f $base, (Get-Date -Format "yyyyMMdd-HHmmss"), $ext))
 }
+
+# Never replace an earlier build: a new suffixed stage folder and zip are used when the names are taken.
+$Zip = Get-UniquePath $Zip
+$Stage = Get-UniquePath $Stage
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
@@ -172,8 +179,8 @@ try {
 }
 
 Write-Host ""
-Write-Host "OK - package FOMOD multi-runtime cree :" -ForegroundColor Green
-Write-Host $Zip
+Write-Host "OK - package FOMOD multi-runtime cree (earlier builds in dist are never replaced) :" -ForegroundColor Green
+Write-Host "Archive written to: $Zip" -ForegroundColor Green
 Write-Host "Runtimes: Skyrim 1.6.1170 + Skyrim 1.7.104"
 Write-Host "FOMOD: Installation Type -> Skyrim Runtime"
 Write-Host "Server destination: Data\SkyrimTogetherReborn\resources\strpm-chat-relay"

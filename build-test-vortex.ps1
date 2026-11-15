@@ -17,7 +17,7 @@ Write-Host "============================================================" -Foreg
 Write-Host " STR Plugin Messaging API v$Version - TEST FOMOD Build" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "Diagnostic client: INCLUDED" -ForegroundColor Yellow
-Write-Host "Expected archive: STRPluginMessagingAPI-v$Version-test.zip" -ForegroundColor Yellow
+Write-Host "Expected archive: STRPluginMessagingAPI-v$Version-test.zip (a _yyyyMMdd-HHmmss suffix is added if that name already exists)" -ForegroundColor Yellow
 Write-Host ""
 
 & $Builder `

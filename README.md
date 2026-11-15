@@ -340,6 +340,8 @@ dist/STRPluginMessagingAPI-v0.10.1-test.zip
 
 The test archive additionally contains a matching `STRPluginMessagingDiagnostic.dll` in **both runtime payloads**, so either FOMOD choice can be tested with the same test ZIP.
 
+Packaging never overwrites or deletes an earlier build: if the zip (or its staging folder) already exists, the new one gets a `_yyyyMMdd-HHmmss` suffix (for example `STRPluginMessagingAPI-v0.10.1_20261114-160500.zip`), so versions sit side by side for rollback; the script prints the final path.
+
 The archive contains separate runtime payloads for 1.6.1170 and 1.7.104. The FOMOD installs only the selected variant into `SKSE/Plugins`.
 
 ## Remaining work
